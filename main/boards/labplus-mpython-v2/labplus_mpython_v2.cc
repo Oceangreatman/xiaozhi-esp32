@@ -31,43 +31,38 @@
 #include <esp_lcd_panel_sh1106.h>
 #endif
 
-
 #define TAG "LabplusMpythonV2"
 
 
 // ============================================================
 // mPython V2 Audio Codec
 //
-// 麦克风：
-// GPIO38 -> ADC1_CH2 -> ADC Continuous DMA -> 24kHz PCM
-// Xiaozhi 自动将 24kHz 重采样到 16kHz
+// MIC:
+// GPIO38 -> ADC Continuous DMA -> 24 kHz
+// Xiaozhi 自动重采样到 16 kHz
 //
-// 扬声器：
-// Xiaozhi -> 24kHz PCM -> ESP32 DAC DMA
-// GPIO25 + GPIO26 -> 扩展板 P9/P8 -> 功放 -> 喇叭
+// Speaker:
+// Xiaozhi 24 kHz PCM
+// -> ESP32 DAC Continuous DMA
+// -> GPIO25 + GPIO26
+// -> 扩展板功放 / 扬声器
 //
-// ESP32 的 ADC Continuous 和 DAC Continuous 都会使用 I2S0，
-// 所以采用“半双工自动切换”：
-// 听的时候只开 ADC，回答的时候只开 DAC。
+// ESP32 ADC DMA 与 DAC DMA 都使用 I2S0，
+// 因此采用半双工自动切换。
 // ============================================================
 
 class MpythonV2AudioCodec : public AudioCodec {
 private:
-
     static constexpr int MIC_GPIO = 38;
 
-    // ESP32 ADC continuous 最低 20kHz
-    // 24kHz -> Xiaozhi 自动重采样为 16kHz
     static constexpr int MIC_SAMPLE_RATE = 24000;
-
     static constexpr int SPEAKER_SAMPLE_RATE = 24000;
 
-    // 模拟麦克风软件增益
-    // 4 倍属于比较保守的值，先避免削波
+    // 先用 4 倍增益
+    // 后面只需要根据实际 peak 调这一项即可
     static constexpr int MIC_GAIN = 4;
 
     static constexpr size_t ADC_BATCH_SIZE = 256;
-
 
     adc_continuous_handle_t adc_handle_ = nullptr;
     dac_continuous_handle_t dac_handle_ = nullptr;
@@ -79,54 +74,43 @@ private:
     bool dac_started_ = false;
 
     std::array<adc_continuous_data_t, ADC_BATCH_SIZE> adc_samples_{};
-
     std::vector<uint8_t> dac_buffer_;
 
-    // 麦克风 DC 偏置
     int32_t mic_dc_q16_ = 0;
     bool mic_dc_initialized_ = false;
 
     uint32_t mic_log_counter_ = 0;
 
-    std::mutex driver_mutex_;
+    // 防止输出任务还在 Write() 时关闭 DAC
+    std::mutex dac_mutex_;
 
 
     // ========================================================
-    // 创建 ADC DMA
+    // 打开麦克风 ADC Continuous DMA
     // ========================================================
 
     bool OpenMicrophone() {
-
-        std::lock_guard<std::mutex> lock(driver_mutex_);
-
         if (adc_handle_ != nullptr) {
             return true;
         }
 
+        ESP_LOGI(TAG, "Opening MIC DMA on GPIO%d", MIC_GPIO);
 
-        ESP_LOGI(TAG, "Opening microphone DMA on GPIO%d", MIC_GPIO);
-
-
-        esp_err_t ret =
-            adc_continuous_io_to_channel(
-                MIC_GPIO,
-                &mic_adc_unit_,
-                &mic_adc_channel_
-            );
-
+        esp_err_t ret = adc_continuous_io_to_channel(
+            MIC_GPIO,
+            &mic_adc_unit_,
+            &mic_adc_channel_
+        );
 
         if (ret != ESP_OK) {
-
             ESP_LOGE(
                 TAG,
-                "GPIO%d is not a valid ADC pin: %s",
+                "GPIO%d ADC mapping failed: %s",
                 MIC_GPIO,
                 esp_err_to_name(ret)
             );
-
             return false;
         }
-
 
         ESP_LOGI(
             TAG,
@@ -140,18 +124,14 @@ private:
         adc_continuous_handle_cfg_t handle_cfg = {};
 
         handle_cfg.max_store_buf_size = 4096;
-        handle_cfg.conv_frame_size = 1024;
+        handle_cfg.conv_frame_size = 512;
 
-
-        ret =
-            adc_continuous_new_handle(
-                &handle_cfg,
-                &adc_handle_
-            );
-
+        ret = adc_continuous_new_handle(
+            &handle_cfg,
+            &adc_handle_
+        );
 
         if (ret != ESP_OK) {
-
             ESP_LOGE(
                 TAG,
                 "adc_continuous_new_handle failed: %s",
@@ -159,7 +139,6 @@ private:
             );
 
             adc_handle_ = nullptr;
-
             return false;
         }
 
@@ -168,14 +147,10 @@ private:
 
         pattern.atten = ADC_ATTEN_DB_12;
         pattern.channel =
-            static_cast<uint8_t>(
-                mic_adc_channel_
-            );
+            static_cast<uint8_t>(mic_adc_channel_);
 
         pattern.unit =
-            static_cast<uint8_t>(
-                mic_adc_unit_
-            );
+            static_cast<uint8_t>(mic_adc_unit_);
 
         pattern.bit_width =
             SOC_ADC_DIGI_MAX_BITWIDTH;
@@ -192,50 +167,42 @@ private:
         adc_cfg.conv_mode =
             ADC_CONV_SINGLE_UNIT_1;
 
+        // 经典 ESP32 单 ADC 模式
+        adc_cfg.format =
+            ADC_DIGI_OUTPUT_FORMAT_TYPE1;
 
-        ret =
-            adc_continuous_config(
-                adc_handle_,
-                &adc_cfg
-            );
 
+        ret = adc_continuous_config(
+            adc_handle_,
+            &adc_cfg
+        );
 
         if (ret != ESP_OK) {
-
             ESP_LOGE(
                 TAG,
                 "adc_continuous_config failed: %s",
                 esp_err_to_name(ret)
             );
 
-            adc_continuous_deinit(
-                adc_handle_
-            );
-
+            adc_continuous_deinit(adc_handle_);
             adc_handle_ = nullptr;
 
             return false;
         }
 
 
-        ret =
-            adc_continuous_start(
-                adc_handle_
-            );
-
+        ret = adc_continuous_start(
+            adc_handle_
+        );
 
         if (ret != ESP_OK) {
-
             ESP_LOGE(
                 TAG,
                 "adc_continuous_start failed: %s",
                 esp_err_to_name(ret)
             );
 
-            adc_continuous_deinit(
-                adc_handle_
-            );
-
+            adc_continuous_deinit(adc_handle_);
             adc_handle_ = nullptr;
 
             return false;
@@ -243,101 +210,74 @@ private:
 
 
         adc_started_ = true;
-
         mic_dc_initialized_ = false;
 
         ESP_LOGI(
             TAG,
-            "Microphone DMA started @ %d Hz",
+            "MIC DMA started @ %d Hz",
             MIC_SAMPLE_RATE
         );
-
 
         return true;
     }
 
 
     // ========================================================
-    // 关闭 ADC DMA
-    //
-    // 必须由启动 ADC 的音频输入任务完成
+    // 关闭并彻底释放 ADC / I2S0
     // ========================================================
 
     void CloseMicrophone() {
-
-        std::lock_guard<std::mutex> lock(driver_mutex_);
-
-
         if (adc_handle_ == nullptr) {
             return;
         }
 
-
-        ESP_LOGI(
-            TAG,
-            "Closing microphone DMA"
-        );
-
+        ESP_LOGI(TAG, "Closing MIC DMA");
 
         if (adc_started_) {
-
             esp_err_t ret =
-                adc_continuous_stop(
-                    adc_handle_
-                );
-
+                adc_continuous_stop(adc_handle_);
 
             if (ret != ESP_OK &&
                 ret != ESP_ERR_INVALID_STATE) {
 
                 ESP_LOGW(
                     TAG,
-                    "ADC stop warning: %s",
+                    "ADC stop: %s",
                     esp_err_to_name(ret)
                 );
             }
-
 
             adc_started_ = false;
         }
 
 
         esp_err_t ret =
-            adc_continuous_deinit(
-                adc_handle_
-            );
-
+            adc_continuous_deinit(adc_handle_);
 
         if (ret != ESP_OK) {
-
             ESP_LOGW(
                 TAG,
-                "ADC deinit warning: %s",
+                "ADC deinit: %s",
                 esp_err_to_name(ret)
             );
         }
 
-
         adc_handle_ = nullptr;
-
         mic_dc_initialized_ = false;
-
 
         ESP_LOGI(
             TAG,
-            "Microphone DMA released I2S0"
+            "MIC released I2S0"
         );
     }
 
 
     // ========================================================
-    // 创建 DAC DMA
+    // 打开 DAC DMA
     // ========================================================
 
     bool OpenSpeaker() {
-
-        std::lock_guard<std::mutex> lock(driver_mutex_);
-
+        std::lock_guard<std::mutex> lock(dac_mutex_);
 
         if (dac_handle_ != nullptr) {
             return true;
@@ -346,42 +286,42 @@ private:
 
         ESP_LOGI(
             TAG,
-            "Opening speaker DAC DMA GPIO25+26"
+            "Opening DAC DMA on GPIO25+GPIO26"
         );
 
 
-        dac_continuous_config_t dac_cfg = {};
+        dac_continuous_config_t cfg = {};
 
-        dac_cfg.chan_mask =
+        // GPIO25 + GPIO26 两路一起开
+        cfg.chan_mask =
             DAC_CHANNEL_MASK_ALL;
 
-        dac_cfg.desc_num = 6;
+        cfg.desc_num = 6;
+        cfg.buf_size = 1024;
 
-        dac_cfg.buf_size = 1024;
-
-        dac_cfg.freq_hz =
+        cfg.freq_hz =
             SPEAKER_SAMPLE_RATE;
 
-        dac_cfg.offset = 0;
+        cfg.offset = 0;
 
-        // APLL 对音频采样率更合适
-        dac_cfg.clk_src =
-            DAC_DIGI_CLK_SRC_APLL;
+        // 24kHz 在 ESP32 默认 DAC 时钟范围内，
+        // 不使用 APLL，减少资源冲突
+        cfg.clk_src =
+            DAC_DIGI_CLK_SRC_DEFAULT;
 
-        // GPIO25 / GPIO26 同时输出相同的单声道信号
-        dac_cfg.chan_mode =
+        // 同一份单声道 PCM 同时送到 25、26
+        cfg.chan_mode =
             DAC_CHANNEL_MODE_SIMUL;
 
 
         esp_err_t ret =
             dac_continuous_new_channels(
-                &dac_cfg,
+                &cfg,
                 &dac_handle_
             );
 
 
         if (ret != ESP_OK) {
-
             ESP_LOGE(
                 TAG,
                 "dac_continuous_new_channels failed: %s",
@@ -389,7 +329,6 @@ private:
             );
 
             dac_handle_ = nullptr;
-
             return false;
         }
 
@@ -401,7 +340,6 @@ private:
 
 
         if (ret != ESP_OK) {
-
             ESP_LOGE(
                 TAG,
                 "dac_continuous_enable failed: %s",
@@ -413,7 +351,6 @@ private:
             );
 
             dac_handle_ = nullptr;
-
             return false;
         }
 
@@ -426,36 +363,28 @@ private:
             SPEAKER_SAMPLE_RATE
         );
 
-
         return true;
     }
 
 
     // ========================================================
-    // 关闭 DAC DMA
+    // 关闭并释放 DAC / I2S0
     // ========================================================
 
     void CloseSpeaker() {
-
-        std::lock_guard<std::mutex> lock(driver_mutex_);
-
+        std::lock_guard<std::mutex> lock(dac_mutex_);
 
         if (dac_handle_ == nullptr) {
             return;
         }
 
 
-        ESP_LOGI(
-            TAG,
-            "Closing speaker DAC"
-        );
+        ESP_LOGI(TAG, "Closing speaker DAC");
 
 
         if (dac_started_) {
-
-            // 先送一点中点电平，减少“啪”声
-            std::array<uint8_t, 64> silence {};
-
+            // 先回到 DAC 中点，减少爆音
+            std::array<uint8_t, 64> silence{};
             silence.fill(128);
 
             size_t written = 0;
@@ -480,11 +409,10 @@ private:
 
                 ESP_LOGW(
                     TAG,
-                    "DAC disable warning: %s",
+                    "DAC disable: %s",
                     esp_err_to_name(ret)
                 );
             }
-
 
             dac_started_ = false;
         }
@@ -497,10 +425,9 @@ private:
 
 
         if (ret != ESP_OK) {
-
             ESP_LOGW(
                 TAG,
-                "DAC delete warning: %s",
+                "DAC delete: %s",
                 esp_err_to_name(ret)
             );
         }
@@ -508,10 +435,9 @@ private:
 
         dac_handle_ = nullptr;
 
-
         ESP_LOGI(
             TAG,
-            "Speaker DAC released I2S0"
+            "Speaker released I2S0"
         );
     }
 
@@ -519,7 +445,7 @@ private:
 protected:
 
     // ========================================================
-    // DMA 麦克风 PCM
+    // ADC DMA -> 16-bit PCM
     // ========================================================
 
     int Read(
@@ -539,68 +465,51 @@ protected:
         int filled = 0;
         int32_t peak = 0;
 
-        int timeout_count = 0;
-
 
         while (filled < samples) {
-
-            uint32_t remaining =
+            uint32_t wanted =
                 static_cast<uint32_t>(
                     samples - filled
                 );
 
-
-            uint32_t want =
-                remaining > ADC_BATCH_SIZE
-                    ? ADC_BATCH_SIZE
-                    : remaining;
+            if (wanted > ADC_BATCH_SIZE) {
+                wanted = ADC_BATCH_SIZE;
+            }
 
 
             uint32_t got = 0;
-
 
             esp_err_t ret =
                 adc_continuous_read_parse(
                     adc_handle_,
                     adc_samples_.data(),
-                    want,
+                    wanted,
                     &got,
                     50
                 );
 
 
             if (ret == ESP_ERR_TIMEOUT) {
+                // 避免因为偶发 timeout 直接结束音频任务
+                std::fill(
+                    dest + filled,
+                    dest + samples,
+                    0
+                );
 
-                timeout_count++;
-
-                if (timeout_count >= 2) {
-
-                    std::fill(
-                        dest + filled,
-                        dest + samples,
-                        0
-                    );
-
-                    return samples;
-                }
-
-                continue;
+                return samples;
             }
 
 
             if (ret != ESP_OK) {
-
                 ESP_LOGE(
                     TAG,
-                    "ADC DMA read error: %s",
+                    "ADC read failed: %s",
                     esp_err_to_name(ret)
                 );
 
                 return 0;
             }
-
-
-            timeout_count = 0;
 
 
             for (
@@ -632,11 +541,10 @@ protected:
 
 
                 // ------------------------------
-                // 自动估计麦克风 DC 中心
+                // 自动消除模拟麦克风 DC 偏置
                 // ------------------------------
 
                 if (!mic_dc_initialized_) {
-
                     mic_dc_q16_ =
                         raw << 16;
 
@@ -644,11 +552,10 @@ protected:
                         true;
 
                 } else {
-
                     int32_t target =
                         raw << 16;
 
-                    // 慢速追踪 DC
+                    // 慢速跟踪直流中心
                     mic_dc_q16_ +=
                         (target - mic_dc_q16_) >> 10;
                 }
@@ -662,8 +569,7 @@ protected:
                     raw - dc;
 
 
-                // 12-bit ADC 映射到 16-bit PCM
-                // 再做 4 倍软件增益
+                // 12-bit ADC -> 16-bit PCM
                 int32_t pcm =
                     centered *
                     16 *
@@ -680,16 +586,11 @@ protected:
 
 
                 dest[filled++] =
-                    static_cast<int16_t>(
-                        pcm
-                    );
+                    static_cast<int16_t>(pcm);
 
 
                 int32_t abs_pcm =
-                    pcm >= 0
-                        ? pcm
-                        : -pcm;
-
+                    pcm >= 0 ? pcm : -pcm;
 
                 if (abs_pcm > peak) {
                     peak = abs_pcm;
@@ -698,9 +599,8 @@ protected:
         }
 
 
-        // 大约每半秒打印一次
+        // 串口观察声音幅度
         if (++mic_log_counter_ >= 50) {
-
             ESP_LOGI(
                 TAG,
                 "MIC DMA: peak=%ld dc=%ld samples=%d",
@@ -711,7 +611,6 @@ protected:
                 samples
             );
 
-
             mic_log_counter_ = 0;
         }
 
@@ -721,7 +620,7 @@ protected:
 
 
     // ========================================================
-    // PCM -> DAC -> 扩展板扬声器
+    // 16-bit PCM -> 8-bit ESP32 DAC
     // ========================================================
 
     int Write(
@@ -730,7 +629,6 @@ protected:
     ) override {
 
         if (!output_enabled_ ||
-            dac_handle_ == nullptr ||
             data == nullptr ||
             samples <= 0) {
 
@@ -739,7 +637,7 @@ protected:
 
 
         std::lock_guard<std::mutex> lock(
-            driver_mutex_
+            dac_mutex_
         );
 
 
@@ -753,9 +651,7 @@ protected:
         );
 
 
-        int volume =
-            output_volume_;
-
+        int volume = output_volume_;
 
         if (volume < 0) {
             volume = 0;
@@ -767,7 +663,6 @@ protected:
 
 
         for (int i = 0; i < samples; ++i) {
-
             int32_t pcm =
                 static_cast<int32_t>(
                     data[i]
@@ -775,9 +670,7 @@ protected:
 
 
             pcm =
-                pcm *
-                volume /
-                100;
+                pcm * volume / 100;
 
 
             if (pcm > 32767) {
@@ -789,8 +682,7 @@ protected:
             }
 
 
-            // signed 16bit PCM
-            // -> unsigned 8bit DAC
+            // int16 PCM -> unsigned DAC 0~255
             int32_t value =
                 (pcm + 32768) >> 8;
 
@@ -813,7 +705,6 @@ protected:
 
         size_t bytes_written = 0;
 
-
         esp_err_t ret =
             dac_continuous_write(
                 dac_handle_,
@@ -825,10 +716,9 @@ protected:
 
 
         if (ret != ESP_OK) {
-
             ESP_LOGE(
                 TAG,
-                "DAC write error: %s",
+                "DAC write failed: %s",
                 esp_err_to_name(ret)
             );
         }
@@ -841,7 +731,7 @@ protected:
 public:
 
     MpythonV2AudioCodec() {
-
+        // 半双工
         duplex_ = false;
 
         input_reference_ = false;
@@ -855,112 +745,87 @@ public:
         output_sample_rate_ =
             SPEAKER_SAMPLE_RATE;
 
-
         dac_buffer_.reserve(2048);
-
 
         ESP_LOGI(
             TAG,
-            "mPython V2 half-duplex DMA codec ready"
+            "mPython V2 DMA audio codec ready"
         );
     }
 
 
+    ~MpythonV2AudioCodec() override {
+        CloseMicrophone();
+        CloseSpeaker();
+    }
+
+
     // ========================================================
-    // 麦克风开关
+    // MIC 开关
     // ========================================================
 
     void EnableInput(bool enable) override {
-
         if (enable == input_enabled_) {
             return;
         }
 
 
         if (enable) {
-
-            ESP_LOGI(
-                TAG,
-                "MIC requested ON"
-            );
+            ESP_LOGI(TAG, "MIC requested ON");
 
 
-            // 如果扬声器还占着 I2S0，
-            // 先把 DAC 完整释放
+            // 如果 DAC 还开着，先关闭扬声器释放 I2S0
             if (output_enabled_) {
-
-                CloseSpeaker();
-
-                AudioCodec::EnableOutput(
-                    false
-                );
+                EnableOutput(false);
             }
 
 
             if (!OpenMicrophone()) {
-
                 ESP_LOGE(
                     TAG,
-                    "Failed to enable microphone"
+                    "Failed to start microphone"
                 );
 
                 return;
             }
 
 
-            AudioCodec::EnableInput(
-                true
-            );
+            AudioCodec::EnableInput(true);
 
         } else {
+            ESP_LOGI(TAG, "MIC requested OFF");
 
-            ESP_LOGI(
-                TAG,
-                "MIC requested OFF"
-            );
-
-
-            // ADC start / stop 均由音频输入任务完成
             CloseMicrophone();
 
-
-            AudioCodec::EnableInput(
-                false
-            );
+            AudioCodec::EnableInput(false);
         }
     }
 
 
     // ========================================================
-    // 扬声器开关
+    // Speaker 开关
     // ========================================================
 
     void EnableOutput(bool enable) override {
-
         if (enable == output_enabled_) {
             return;
         }
 
 
         if (enable) {
-
             ESP_LOGI(
                 TAG,
                 "Speaker requested ON"
             );
 
 
-            // ADC Continuous 必须先由 audio_input
-            // 任务自己停止并释放 I2S0。
-            //
-            // audio_service.cc 的修改会立即唤醒输入任务。
-            // 这里最多等待约 500ms。
+            // 等 audio_input task 自己关闭 ADC。
+            // 正常情况下几十毫秒内完成。
             for (
                 int i = 0;
-                i < 100 && input_enabled_;
+                i < 200 && input_enabled_;
                 ++i
             ) {
-
                 vTaskDelay(
                     pdMS_TO_TICKS(5)
                 );
@@ -968,10 +833,9 @@ public:
 
 
             if (input_enabled_) {
-
                 ESP_LOGE(
                     TAG,
-                    "MIC still owns I2S0, speaker start aborted"
+                    "MIC still owns I2S0"
                 );
 
                 return;
@@ -979,97 +843,58 @@ public:
 
 
             if (!OpenSpeaker()) {
-
                 ESP_LOGE(
                     TAG,
-                    "Failed to enable speaker"
+                    "Failed to start speaker"
                 );
 
                 return;
             }
 
 
-            AudioCodec::EnableOutput(
-                true
-            );
+            AudioCodec::EnableOutput(true);
 
         } else {
-
             ESP_LOGI(
                 TAG,
                 "Speaker requested OFF"
             );
 
-
             CloseSpeaker();
 
-
-            AudioCodec::EnableOutput(
-                false
-            );
+            AudioCodec::EnableOutput(false);
         }
     }
 };
 
 
 // ============================================================
-// Labplus mPython V2 Board
+// Board
 // ============================================================
 
 class LabplusMpythonV2 : public WifiBoard {
 private:
+    i2c_master_bus_handle_t display_i2c_bus_ = nullptr;
+    esp_lcd_panel_io_handle_t panel_io_ = nullptr;
+    esp_lcd_panel_handle_t panel_ = nullptr;
 
-    i2c_master_bus_handle_t
-        display_i2c_bus_ = nullptr;
-
-    esp_lcd_panel_io_handle_t
-        panel_io_ = nullptr;
-
-    esp_lcd_panel_handle_t
-        panel_ = nullptr;
-
-    Display*
-        display_ = nullptr;
-
+    Display* display_ = nullptr;
 
     Button boot_button_;
     Button button_b_;
 
 
-    // ========================================================
-    // OLED I2C
-    // ========================================================
-
     void InitializeDisplayI2c() {
+        i2c_master_bus_config_t bus_config = {};
 
-        i2c_master_bus_config_t
-            bus_config = {};
-
-
-        bus_config.i2c_port =
-            I2C_NUM_0;
-
-        bus_config.sda_io_num =
-            DISPLAY_SDA_PIN;
-
-        bus_config.scl_io_num =
-            DISPLAY_SCL_PIN;
-
-        bus_config.clk_source =
-            I2C_CLK_SRC_DEFAULT;
-
-        bus_config.glitch_ignore_cnt =
-            7;
-
-        bus_config.intr_priority =
-            0;
-
-        bus_config.trans_queue_depth =
-            0;
-
-        bus_config.flags.enable_internal_pullup =
-            1;
-
+        bus_config.i2c_port = I2C_NUM_0;
+        bus_config.sda_io_num = DISPLAY_SDA_PIN;
+        bus_config.scl_io_num = DISPLAY_SCL_PIN;
+        bus_config.clk_source = I2C_CLK_SRC_DEFAULT;
+        bus_config.glitch_ignore_cnt = 7;
+        bus_config.intr_priority = 0;
+        bus_config.trans_queue_depth = 0;
+        bus_config.flags.enable_internal_pullup = 1;
 
         ESP_ERROR_CHECK(
             i2c_new_master_bus(
@@ -1080,46 +905,19 @@ private:
     }
 
 
-    // ========================================================
-    // OLED
-    // ========================================================
-
     void InitializeDisplay() {
+        esp_lcd_panel_io_i2c_config_t io_config = {};
 
-        esp_lcd_panel_io_i2c_config_t
-            io_config = {};
-
-
-        io_config.dev_addr =
-            0x3C;
-
-        io_config.scl_speed_hz =
-            400 * 1000;
-
-        io_config.control_phase_bytes =
-            1;
-
-        io_config.dc_bit_offset =
-            6;
-
-        io_config.lcd_cmd_bits =
-            8;
-
-        io_config.lcd_param_bits =
-            8;
-
-        io_config.on_color_trans_done =
-            nullptr;
-
-        io_config.user_ctx =
-            nullptr;
-
-        io_config.flags.dc_low_on_data =
-            0;
-
-        io_config.flags.disable_control_phase =
-            0;
-
+        io_config.dev_addr = 0x3C;
+        io_config.scl_speed_hz = 400 * 1000;
+        io_config.control_phase_bytes = 1;
+        io_config.dc_bit_offset = 6;
+        io_config.lcd_cmd_bits = 8;
+        io_config.lcd_param_bits = 8;
+        io_config.on_color_trans_done = nullptr;
+        io_config.user_ctx = nullptr;
+        io_config.flags.dc_low_on_data = 0;
+        io_config.flags.disable_control_phase = 0;
 
         ESP_ERROR_CHECK(
             esp_lcd_new_panel_io_i2c(
@@ -1130,38 +928,28 @@ private:
         );
 
 
-        esp_lcd_panel_dev_config_t
-            panel_config = {};
+        esp_lcd_panel_dev_config_t panel_config = {};
+
+        panel_config.reset_gpio_num = GPIO_NUM_NC;
+        panel_config.bits_per_pixel = 1;
 
 
-        panel_config.reset_gpio_num =
-            GPIO_NUM_NC;
-
-        panel_config.bits_per_pixel =
-            1;
-
-
-        esp_lcd_panel_ssd1306_config_t
-            oled_config = {};
-
+        esp_lcd_panel_ssd1306_config_t oled_config = {};
 
         oled_config.height =
             static_cast<uint8_t>(
                 DISPLAY_HEIGHT
             );
 
-
         panel_config.vendor_config =
             &oled_config;
 
 
 #ifdef SH1106
-
         ESP_LOGI(
             TAG,
             "Initializing SH1106 OLED"
         );
-
 
         ESP_ERROR_CHECK(
             esp_lcd_new_panel_sh1106(
@@ -1170,14 +958,11 @@ private:
                 &panel_
             )
         );
-
 #else
-
         ESP_LOGI(
             TAG,
             "Initializing SSD1306 OLED"
         );
-
 
         ESP_ERROR_CHECK(
             esp_lcd_new_panel_ssd1306(
@@ -1186,32 +971,24 @@ private:
                 &panel_
             )
         );
-
 #endif
 
 
         ESP_ERROR_CHECK(
-            esp_lcd_panel_reset(
-                panel_
-            )
+            esp_lcd_panel_reset(panel_)
         );
 
 
         if (
-            esp_lcd_panel_init(
-                panel_
-            ) != ESP_OK
+            esp_lcd_panel_init(panel_)
+            != ESP_OK
         ) {
-
             ESP_LOGE(
                 TAG,
                 "Failed to initialize OLED"
             );
 
-
-            display_ =
-                new NoDisplay();
-
+            display_ = new NoDisplay();
             return;
         }
 
@@ -1223,7 +1000,6 @@ private:
             )
         );
 
-
         ESP_ERROR_CHECK(
             esp_lcd_panel_disp_on_off(
                 panel_,
@@ -1232,99 +1008,68 @@ private:
         );
 
 
-        display_ =
-            new OledDisplay(
-                panel_io_,
-                panel_,
-                DISPLAY_WIDTH,
-                DISPLAY_HEIGHT,
-                DISPLAY_MIRROR_X,
-                DISPLAY_MIRROR_Y
-            );
+        display_ = new OledDisplay(
+            panel_io_,
+            panel_,
+            DISPLAY_WIDTH,
+            DISPLAY_HEIGHT,
+            DISPLAY_MIRROR_X,
+            DISPLAY_MIRROR_Y
+        );
     }
 
 
-    // ========================================================
-    // Buttons
-    // ========================================================
-
     void InitializeButtons() {
-
         // A 键
-        boot_button_.OnClick(
-            [this]() {
+        boot_button_.OnClick([this]() {
+            auto& app =
+                Application::GetInstance();
 
-                auto& app =
-                    Application::GetInstance();
-
-
-                if (
-                    app.GetDeviceState() ==
-                    kDeviceStateStarting
-                ) {
-
-                    EnterWifiConfigMode();
-
-                    return;
-                }
-
-
-                app.ToggleChatState();
+            if (
+                app.GetDeviceState()
+                == kDeviceStateStarting
+            ) {
+                EnterWifiConfigMode();
+                return;
             }
-        );
+
+            app.ToggleChatState();
+        });
 
 
-        // B 键按住讲话
-        button_b_.OnPressDown(
-            [this]() {
+        // B 键按下
+        button_b_.OnPressDown([this]() {
+            ESP_LOGI(
+                TAG,
+                "B DOWN -> StartListening"
+            );
 
-                ESP_LOGI(
-                    TAG,
-                    "B DOWN -> StartListening"
-                );
-
-
-                Application::GetInstance()
-                    .StartListening();
-            }
-        );
+            Application::GetInstance()
+                .StartListening();
+        });
 
 
         // B 键松开
-        button_b_.OnPressUp(
-            [this]() {
+        button_b_.OnPressUp([this]() {
+            ESP_LOGI(
+                TAG,
+                "B UP -> StopListening"
+            );
 
-                ESP_LOGI(
-                    TAG,
-                    "B UP -> StopListening"
-                );
-
-
-                Application::GetInstance()
-                    .StopListening();
-            }
-        );
+            Application::GetInstance()
+                .StopListening();
+        });
     }
 
 
 public:
-
     LabplusMpythonV2()
-        :
-        boot_button_(
-            BOOT_BUTTON_GPIO
-        ),
-        button_b_(
-            BUTTON_B_GPIO
-        ) {
-
+        : boot_button_(BOOT_BUTTON_GPIO),
+          button_b_(BUTTON_B_GPIO) {
 
         InitializeDisplayI2c();
-
         InitializeDisplay();
-
         InitializeButtons();
-
 
         ESP_LOGI(
             TAG,
@@ -1333,9 +1078,7 @@ public:
     }
 
 
-    AudioCodec*
-    GetAudioCodec() override {
-
+    AudioCodec* GetAudioCodec() override {
         static MpythonV2AudioCodec
             audio_codec;
 
@@ -1343,9 +1086,7 @@ public:
     }
 
 
-    Display*
-    GetDisplay() override {
-
+    Display* GetDisplay() override {
         return display_;
     }
 };
