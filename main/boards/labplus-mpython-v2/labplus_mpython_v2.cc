@@ -14,6 +14,7 @@
 #include <esp_lcd_panel_sh1106.h>
 #endif
 
+// Labplus mPython V2 custom board support
 #define TAG "LabplusMpythonV2"
 
 class LabplusMpythonV2 : public WifiBoard {
