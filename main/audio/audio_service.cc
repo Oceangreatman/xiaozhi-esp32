@@ -724,12 +724,31 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         audio_engine_->EnableVoiceProcessing(true);
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     } else {
-        if (audio_engine_initialized_) {
-            audio_engine_->EnableVoiceProcessing(false);
-        }
-        xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+
+    if (audio_engine_initialized_) {
+        audio_engine_->EnableVoiceProcessing(false);
     }
+
+    // 先清除“正在处理语音”状态
+    xEventGroupClearBits(
+        event_group_,
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING
+    );
+
+    // mPython V2 使用 ADC Continuous DMA。
+    // ADC 会占用 ESP32 的 I2S0。
+    //
+    // 松开 B 停止聆听后，立即通知 audio_input 任务
+    // 关闭 ADC 并释放 I2S0。
+    //
+    // 随后 DAC Continuous 就可以接管 I2S0，
+    // 通过 GPIO25 / GPIO26 播放小智的回答。
+    xEventGroupSetBits(
+        event_group_,
+        AS_EVENT_AUDIO_INPUT_STOP_REQUEST
+    );
 }
+    } 
 
 void AudioService::EnableAudioTesting(bool enable) {
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");
