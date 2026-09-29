@@ -7,21 +7,25 @@
 
 #include <esp_log.h>
 #include <esp_err.h>
-#include <esp_timer.h>
-#include <esp_rom_sys.h>
 
 #include <driver/i2c_master.h>
 #include <driver/dac_continuous.h>
 
-#include <esp_adc/adc_oneshot.h>
+#include <esp_adc/adc_continuous.h>
 
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 
-#include <vector>
+#include <soc/soc_caps.h>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 #include <array>
-#include <cstdint>
+#include <vector>
+#include <mutex>
 #include <algorithm>
+#include <cstdint>
 
 #ifdef SH1106
 #include <esp_lcd_panel_sh1106.h>
@@ -32,429 +36,82 @@
 
 
 // ============================================================
-// Labplus mPython V2 Audio Codec
+// mPython V2 Audio Codec
 //
-// MIC:
-//   onboard microphone
-//       -> GPIO38
-//       -> ADC1 CH2
-//       -> 16 kHz / 16 bit PCM
+// 麦克风：
+// GPIO38 -> ADC1_CH2 -> ADC Continuous DMA -> 24kHz PCM
+// Xiaozhi 自动将 24kHz 重采样到 16kHz
 //
-// SPEAKER:
-//   Xiaozhi PCM
-//       -> ESP32 internal DAC
-//       -> GPIO25 + GPIO26
-//       -> P9 + P8
-//       -> expansion-board amplifier / speaker
+// 扬声器：
+// Xiaozhi -> 24kHz PCM -> ESP32 DAC DMA
+// GPIO25 + GPIO26 -> 扩展板 P9/P8 -> 功放 -> 喇叭
 //
-// 注意：
-// ESP32 的 ADC continuous 与 DAC continuous 都会占 I2S0。
-// 因此 MIC 使用 ADC oneshot 定时采样，DAC 使用 DMA continuous。
-// 这样输入输出可以存在于同一个固件中，不争抢 I2S0。
+// ESP32 的 ADC Continuous 和 DAC Continuous 都会使用 I2S0，
+// 所以采用“半双工自动切换”：
+// 听的时候只开 ADC，回答的时候只开 DAC。
 // ============================================================
 
 class MpythonV2AudioCodec : public AudioCodec {
 private:
 
-    static constexpr adc_unit_t MIC_ADC_UNIT = ADC_UNIT_1;
-    static constexpr adc_channel_t MIC_ADC_CHANNEL = ADC_CHANNEL_2;
+    static constexpr int MIC_GPIO = 38;
 
-    // GPIO38 = ADC1_CH2
-    static constexpr int MIC_SAMPLE_RATE = 16000;
+    // ESP32 ADC continuous 最低 20kHz
+    // 24kHz -> Xiaozhi 自动重采样为 16kHz
+    static constexpr int MIC_SAMPLE_RATE = 24000;
 
-    // ESP32 DAC PLL 默认时钟要求较高频率，
-    // 24 kHz 很适合 Xiaozhi 语音播放
     static constexpr int SPEAKER_SAMPLE_RATE = 24000;
 
-    // 软件麦克风增益
+    // 模拟麦克风软件增益
+    // 4 倍属于比较保守的值，先避免削波
     static constexpr int MIC_GAIN = 4;
 
-    adc_oneshot_unit_handle_t adc_handle_ = nullptr;
+    static constexpr size_t ADC_BATCH_SIZE = 256;
 
+
+    adc_continuous_handle_t adc_handle_ = nullptr;
     dac_continuous_handle_t dac_handle_ = nullptr;
+
+    adc_unit_t mic_adc_unit_ = ADC_UNIT_1;
+    adc_channel_t mic_adc_channel_ = ADC_CHANNEL_2;
+
+    bool adc_started_ = false;
+    bool dac_started_ = false;
+
+    std::array<adc_continuous_data_t, ADC_BATCH_SIZE> adc_samples_{};
 
     std::vector<uint8_t> dac_buffer_;
 
+    // 麦克风 DC 偏置
     int32_t mic_dc_q16_ = 0;
     bool mic_dc_initialized_ = false;
 
     uint32_t mic_log_counter_ = 0;
 
-
-    // --------------------------------------------------------
-    // MIC ADC
-    // --------------------------------------------------------
-
-    void InitializeMicrophone() {
-
-        ESP_LOGI(
-            TAG,
-            "Initializing microphone: GPIO38 / ADC1_CH2"
-        );
-
-        adc_oneshot_unit_init_cfg_t adc_init = {};
-
-        adc_init.unit_id = MIC_ADC_UNIT;
-
-        ESP_ERROR_CHECK(
-            adc_oneshot_new_unit(
-                &adc_init,
-                &adc_handle_
-            )
-        );
-
-
-        adc_oneshot_chan_cfg_t mic_cfg = {};
-
-        mic_cfg.atten = ADC_ATTEN_DB_12;
-        mic_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
-
-
-        ESP_ERROR_CHECK(
-            adc_oneshot_config_channel(
-                adc_handle_,
-                MIC_ADC_CHANNEL,
-                &mic_cfg
-            )
-        );
-
-
-        ESP_LOGI(
-            TAG,
-            "Microphone ready: 16000 Hz"
-        );
-    }
-
-
-    // --------------------------------------------------------
-    // Internal DAC
-    //
-    // GPIO25 = DAC1 / P9
-    // GPIO26 = DAC2 / P8
-    //
-    // SAME PCM is sent to both channels.
-    // --------------------------------------------------------
-
-    void InitializeSpeaker() {
-
-        ESP_LOGI(
-            TAG,
-            "Initializing speaker DAC on GPIO25 + GPIO26"
-        );
-
-
-        dac_continuous_config_t dac_config = {};
-
-        // 两路都开
-        dac_config.chan_mask =
-            DAC_CHANNEL_MASK_ALL;
-
-        // DMA 描述符
-        dac_config.desc_num =
-            4;
-
-        dac_config.buf_size =
-            1024;
-
-        // 24 kHz
-        dac_config.freq_hz =
-            SPEAKER_SAMPLE_RATE;
-
-        dac_config.offset =
-            0;
-
-        dac_config.clk_src =
-            DAC_DIGI_CLK_SRC_DEFAULT;
-
-        // 两个 DAC 同时输出同一个采样值
-        // 适合小智单声道语音
-        dac_config.chan_mode =
-            DAC_CHANNEL_MODE_SIMUL;
-
-
-        ESP_ERROR_CHECK(
-            dac_continuous_new_channels(
-                &dac_config,
-                &dac_handle_
-            )
-        );
-
-
-        // 提前留好缓存，避免播放时反复申请内存
-        dac_buffer_.reserve(2048);
-
-
-        ESP_LOGI(
-            TAG,
-            "Speaker DAC ready: 24000 Hz, GPIO25+26"
-        );
-    }
-
-
-protected:
-
-    // ========================================================
-    // MIC -> Xiaozhi
-    // ========================================================
-
-    int Read(
-        int16_t* dest,
-        int samples
-    ) override {
-
-        if (!input_enabled_ ||
-            adc_handle_ == nullptr ||
-            dest == nullptr ||
-            samples <= 0) {
-
-            return 0;
-        }
-
-
-        // 16000 Hz = 每个采样约 62.5 us
-        int64_t next_sample_us =
-            esp_timer_get_time();
-
-        uint32_t timing_accumulator = 0;
-
-        int32_t peak = 0;
-
-
-        for (int i = 0; i < samples; ++i) {
-
-            // 精确控制平均采样率为 16 kHz
-            while (true) {
-
-                int64_t now =
-                    esp_timer_get_time();
-
-                int64_t wait =
-                    next_sample_us - now;
-
-                if (wait <= 0) {
-                    break;
-                }
-
-                if (wait > 2) {
-                    esp_rom_delay_us(
-                        static_cast<uint32_t>(wait)
-                    );
-                }
-            }
-
-
-            int raw = 0;
-
-            esp_err_t ret =
-                adc_oneshot_read(
-                    adc_handle_,
-                    MIC_ADC_CHANNEL,
-                    &raw
-                );
-
-
-            if (ret != ESP_OK) {
-
-                ESP_LOGW(
-                    TAG,
-                    "MIC ADC read failed: %s",
-                    esp_err_to_name(ret)
-                );
-
-                dest[i] = 0;
-
-            } else {
-
-                // ------------------------------
-                // 自动追踪麦克风 DC 偏置
-                // ------------------------------
-
-                if (!mic_dc_initialized_) {
-
-                    mic_dc_q16_ =
-                        raw << 16;
-
-                    mic_dc_initialized_ =
-                        true;
-
-                } else {
-
-                    const int32_t target =
-                        raw << 16;
-
-                    // 慢速 DC 跟踪
-                    mic_dc_q16_ +=
-                        (target - mic_dc_q16_) >> 10;
-                }
-
-
-                const int32_t dc =
-                    mic_dc_q16_ >> 16;
-
-
-                int32_t centered =
-                    raw - dc;
-
-
-                // 12-bit ADC -> 16-bit PCM
-                int32_t pcm =
-                    centered * 16 * MIC_GAIN;
-
-
-                // 限幅
-                if (pcm > 32767) {
-                    pcm = 32767;
-                }
-
-                if (pcm < -32768) {
-                    pcm = -32768;
-                }
-
-
-                dest[i] =
-                    static_cast<int16_t>(pcm);
-
-
-                int32_t abs_pcm =
-                    pcm >= 0
-                        ? pcm
-                        : -pcm;
-
-                if (abs_pcm > peak) {
-                    peak = abs_pcm;
-                }
-            }
-
-
-            // 1,000,000 / 16,000 = 62.5 us
-            //
-            // 用整数累加方式交替 62 / 63 us，
-            // 避免长期采样率漂移
-            timing_accumulator +=
-                1000000;
-
-            uint32_t step =
-                timing_accumulator /
-                MIC_SAMPLE_RATE;
-
-            timing_accumulator %=
-                MIC_SAMPLE_RATE;
-
-            next_sample_us +=
-                step;
-        }
-
-
-        // 大约每 1 秒打印一次 MIC 峰值
-        if (++mic_log_counter_ >= 100) {
-
-            ESP_LOGI(
-                TAG,
-                "MIC: samples=%d peak=%ld dc=%ld",
-                samples,
-                static_cast<long>(peak),
-                static_cast<long>(
-                    mic_dc_q16_ >> 16
-                )
-            );
-
-            mic_log_counter_ = 0;
-        }
-
-
-        return samples;
-    }
+    std::mutex driver_mutex_;
 
 
     // ========================================================
-    // Xiaozhi -> DAC -> expansion-board speaker
+    // 创建 ADC DMA
     // ========================================================
 
-    int Write(
-        const int16_t* data,
-        int samples
-    ) override {
+    bool OpenMicrophone() {
 
-        if (!output_enabled_ ||
-            dac_handle_ == nullptr ||
-            data == nullptr ||
-            samples <= 0) {
+        std::lock_guard<std::mutex> lock(driver_mutex_);
 
-            return samples;
+        if (adc_handle_ != nullptr) {
+            return true;
         }
 
 
-        dac_buffer_.resize(samples);
-
-
-        int volume =
-            output_volume_;
-
-        if (volume < 0) {
-            volume = 0;
-        }
-
-        // 允许 Xiaozhi 音量超过 100 时仍安全限幅
-        if (volume > 150) {
-            volume = 150;
-        }
-
-
-        for (int i = 0; i < samples; ++i) {
-
-            // 音量处理
-            int32_t pcm =
-                static_cast<int32_t>(
-                    data[i]
-                ) * volume / 100;
-
-
-            if (pcm > 32767) {
-                pcm = 32767;
-            }
-
-            if (pcm < -32768) {
-                pcm = -32768;
-            }
-
-
-            // signed 16bit
-            // -32768 ... +32767
-            //
-            // -> unsigned 8bit
-            // 0 ... 255
-            //
-            // 128 是 DAC 的静音中心点
-            int32_t dac_sample =
-                (pcm + 32768) >> 8;
-
-
-            if (dac_sample < 0) {
-                dac_sample = 0;
-            }
-
-            if (dac_sample > 255) {
-                dac_sample = 255;
-            }
-
-
-            dac_buffer_[i] =
-                static_cast<uint8_t>(
-                    dac_sample
-                );
-        }
-
-
-        size_t bytes_written = 0;
+        ESP_LOGI(TAG, "Opening microphone DMA on GPIO%d", MIC_GPIO);
 
 
         esp_err_t ret =
-            dac_continuous_write(
-                dac_handle_,
-                dac_buffer_.data(),
-                dac_buffer_.size(),
-                &bytes_written,
-                -1
+            adc_continuous_io_to_channel(
+                MIC_GPIO,
+                &mic_adc_unit_,
+                &mic_adc_channel_
             );
 
 
@@ -462,168 +119,344 @@ protected:
 
             ESP_LOGE(
                 TAG,
-                "DAC write failed: %s",
+                "GPIO%d is not a valid ADC pin: %s",
+                MIC_GPIO,
+                esp_err_to_name(ret)
+            );
+
+            return false;
+        }
+
+
+        ESP_LOGI(
+            TAG,
+            "MIC GPIO%d -> ADC%d channel %d",
+            MIC_GPIO,
+            static_cast<int>(mic_adc_unit_) + 1,
+            static_cast<int>(mic_adc_channel_)
+        );
+
+
+        adc_continuous_handle_cfg_t handle_cfg = {};
+
+        handle_cfg.max_store_buf_size = 4096;
+        handle_cfg.conv_frame_size = 1024;
+
+
+        ret =
+            adc_continuous_new_handle(
+                &handle_cfg,
+                &adc_handle_
+            );
+
+
+        if (ret != ESP_OK) {
+
+            ESP_LOGE(
+                TAG,
+                "adc_continuous_new_handle failed: %s",
+                esp_err_to_name(ret)
+            );
+
+            adc_handle_ = nullptr;
+
+            return false;
+        }
+
+
+        adc_digi_pattern_config_t pattern = {};
+
+        pattern.atten = ADC_ATTEN_DB_12;
+        pattern.channel =
+            static_cast<uint8_t>(
+                mic_adc_channel_
+            );
+
+        pattern.unit =
+            static_cast<uint8_t>(
+                mic_adc_unit_
+            );
+
+        pattern.bit_width =
+            SOC_ADC_DIGI_MAX_BITWIDTH;
+
+
+        adc_continuous_config_t adc_cfg = {};
+
+        adc_cfg.pattern_num = 1;
+        adc_cfg.adc_pattern = &pattern;
+
+        adc_cfg.sample_freq_hz =
+            MIC_SAMPLE_RATE;
+
+        adc_cfg.conv_mode =
+            ADC_CONV_SINGLE_UNIT_1;
+
+
+        ret =
+            adc_continuous_config(
+                adc_handle_,
+                &adc_cfg
+            );
+
+
+        if (ret != ESP_OK) {
+
+            ESP_LOGE(
+                TAG,
+                "adc_continuous_config failed: %s",
+                esp_err_to_name(ret)
+            );
+
+            adc_continuous_deinit(
+                adc_handle_
+            );
+
+            adc_handle_ = nullptr;
+
+            return false;
+        }
+
+
+        ret =
+            adc_continuous_start(
+                adc_handle_
+            );
+
+
+        if (ret != ESP_OK) {
+
+            ESP_LOGE(
+                TAG,
+                "adc_continuous_start failed: %s",
+                esp_err_to_name(ret)
+            );
+
+            adc_continuous_deinit(
+                adc_handle_
+            );
+
+            adc_handle_ = nullptr;
+
+            return false;
+        }
+
+
+        adc_started_ = true;
+
+        mic_dc_initialized_ = false;
+
+        ESP_LOGI(
+            TAG,
+            "Microphone DMA started @ %d Hz",
+            MIC_SAMPLE_RATE
+        );
+
+
+        return true;
+    }
+
+
+    // ========================================================
+    // 关闭 ADC DMA
+    //
+    // 必须由启动 ADC 的音频输入任务完成
+    // ========================================================
+
+    void CloseMicrophone() {
+
+        std::lock_guard<std::mutex> lock(driver_mutex_);
+
+
+        if (adc_handle_ == nullptr) {
+            return;
+        }
+
+
+        ESP_LOGI(
+            TAG,
+            "Closing microphone DMA"
+        );
+
+
+        if (adc_started_) {
+
+            esp_err_t ret =
+                adc_continuous_stop(
+                    adc_handle_
+                );
+
+
+            if (ret != ESP_OK &&
+                ret != ESP_ERR_INVALID_STATE) {
+
+                ESP_LOGW(
+                    TAG,
+                    "ADC stop warning: %s",
+                    esp_err_to_name(ret)
+                );
+            }
+
+
+            adc_started_ = false;
+        }
+
+
+        esp_err_t ret =
+            adc_continuous_deinit(
+                adc_handle_
+            );
+
+
+        if (ret != ESP_OK) {
+
+            ESP_LOGW(
+                TAG,
+                "ADC deinit warning: %s",
                 esp_err_to_name(ret)
             );
         }
 
 
-        return samples;
-    }
+        adc_handle_ = nullptr;
 
-
-public:
-
-    MpythonV2AudioCodec() {
-
-        // 小智这里按单声道使用
-        input_channels_ = 1;
-        output_channels_ = 1;
-
-        input_reference_ = false;
-
-        // 没有硬件 AEC，声明为非硬件全双工 Codec
-        duplex_ = false;
-
-
-        input_sample_rate_ =
-            MIC_SAMPLE_RATE;
-
-        output_sample_rate_ =
-            SPEAKER_SAMPLE_RATE;
-
-
-        InitializeMicrophone();
-
-        InitializeSpeaker();
+        mic_dc_initialized_ = false;
 
 
         ESP_LOGI(
             TAG,
-            "mPython V2 AudioCodec initialized"
+            "Microphone DMA released I2S0"
         );
     }
 
 
-    ~MpythonV2AudioCodec() override {
+    // ========================================================
+    // 创建 DAC DMA
+    // ========================================================
+
+    bool OpenSpeaker() {
+
+        std::lock_guard<std::mutex> lock(driver_mutex_);
+
 
         if (dac_handle_ != nullptr) {
+            return true;
+        }
 
-            if (output_enabled_) {
-                dac_continuous_disable(
-                    dac_handle_
-                );
-            }
+
+        ESP_LOGI(
+            TAG,
+            "Opening speaker DAC DMA GPIO25+26"
+        );
+
+
+        dac_continuous_config_t dac_cfg = {};
+
+        dac_cfg.chan_mask =
+            DAC_CHANNEL_MASK_ALL;
+
+        dac_cfg.desc_num = 6;
+
+        dac_cfg.buf_size = 1024;
+
+        dac_cfg.freq_hz =
+            SPEAKER_SAMPLE_RATE;
+
+        dac_cfg.offset = 0;
+
+        // APLL 对音频采样率更合适
+        dac_cfg.clk_src =
+            DAC_DIGI_CLK_SRC_APLL;
+
+        // GPIO25 / GPIO26 同时输出相同的单声道信号
+        dac_cfg.chan_mode =
+            DAC_CHANNEL_MODE_SIMUL;
+
+
+        esp_err_t ret =
+            dac_continuous_new_channels(
+                &dac_cfg,
+                &dac_handle_
+            );
+
+
+        if (ret != ESP_OK) {
+
+            ESP_LOGE(
+                TAG,
+                "dac_continuous_new_channels failed: %s",
+                esp_err_to_name(ret)
+            );
+
+            dac_handle_ = nullptr;
+
+            return false;
+        }
+
+
+        ret =
+            dac_continuous_enable(
+                dac_handle_
+            );
+
+
+        if (ret != ESP_OK) {
+
+            ESP_LOGE(
+                TAG,
+                "dac_continuous_enable failed: %s",
+                esp_err_to_name(ret)
+            );
 
             dac_continuous_del_channels(
                 dac_handle_
             );
 
             dac_handle_ = nullptr;
+
+            return false;
         }
 
 
-        if (adc_handle_ != nullptr) {
+        dac_started_ = true;
 
-            adc_oneshot_del_unit(
-                adc_handle_
-            );
-
-            adc_handle_ = nullptr;
-        }
-    }
-
-
-    // ========================================================
-    // MIC power state
-    // ========================================================
-
-    void EnableInput(
-        bool enable
-    ) override {
-
-        if (enable == input_enabled_) {
-            return;
-        }
-
-
-        if (enable) {
-
-            ESP_LOGI(
-                TAG,
-                "Microphone ON"
-            );
-
-            // 每次重新聆听都重新建立 DC 基线
-            mic_dc_initialized_ = false;
-
-        } else {
-
-            ESP_LOGI(
-                TAG,
-                "Microphone OFF"
-            );
-        }
-
-
-        AudioCodec::EnableInput(
-            enable
+        ESP_LOGI(
+            TAG,
+            "Speaker DAC started @ %d Hz",
+            SPEAKER_SAMPLE_RATE
         );
+
+
+        return true;
     }
 
 
     // ========================================================
-    // Speaker power state
+    // 关闭 DAC DMA
     // ========================================================
 
-    void EnableOutput(
-        bool enable
-    ) override {
+    void CloseSpeaker() {
 
-        if (enable == output_enabled_) {
+        std::lock_guard<std::mutex> lock(driver_mutex_);
+
+
+        if (dac_handle_ == nullptr) {
             return;
         }
 
 
-        if (enable) {
-
-            ESP_LOGI(
-                TAG,
-                "Speaker ON"
-            );
+        ESP_LOGI(
+            TAG,
+            "Closing speaker DAC"
+        );
 
 
-            esp_err_t ret =
-                dac_continuous_enable(
-                    dac_handle_
-                );
+        if (dac_started_) {
 
-
-            if (ret != ESP_OK) {
-
-                ESP_LOGE(
-                    TAG,
-                    "DAC enable failed: %s",
-                    esp_err_to_name(ret)
-                );
-
-                return;
-            }
-
-        } else {
-
-            ESP_LOGI(
-                TAG,
-                "Speaker OFF"
-            );
-
-
-            // 关闭之前将 DAC 拉回中点，
-            // 避免喇叭出现“啪”的直流跳变声
+            // 先送一点中点电平，减少“啪”声
             std::array<uint8_t, 64> silence {};
 
             silence.fill(128);
-
 
             size_t written = 0;
 
@@ -642,7 +475,8 @@ public:
                 );
 
 
-            if (ret != ESP_OK) {
+            if (ret != ESP_OK &&
+                ret != ESP_ERR_INVALID_STATE) {
 
                 ESP_LOGW(
                     TAG,
@@ -650,12 +484,530 @@ public:
                     esp_err_to_name(ret)
                 );
             }
+
+
+            dac_started_ = false;
         }
 
 
-        AudioCodec::EnableOutput(
-            enable
+        esp_err_t ret =
+            dac_continuous_del_channels(
+                dac_handle_
+            );
+
+
+        if (ret != ESP_OK) {
+
+            ESP_LOGW(
+                TAG,
+                "DAC delete warning: %s",
+                esp_err_to_name(ret)
+            );
+        }
+
+
+        dac_handle_ = nullptr;
+
+
+        ESP_LOGI(
+            TAG,
+            "Speaker DAC released I2S0"
         );
+    }
+
+
+protected:
+
+    // ========================================================
+    // DMA 麦克风 PCM
+    // ========================================================
+
+    int Read(
+        int16_t* dest,
+        int samples
+    ) override {
+
+        if (!input_enabled_ ||
+            adc_handle_ == nullptr ||
+            dest == nullptr ||
+            samples <= 0) {
+
+            return 0;
+        }
+
+
+        int filled = 0;
+        int32_t peak = 0;
+
+        int timeout_count = 0;
+
+
+        while (filled < samples) {
+
+            uint32_t remaining =
+                static_cast<uint32_t>(
+                    samples - filled
+                );
+
+
+            uint32_t want =
+                remaining > ADC_BATCH_SIZE
+                    ? ADC_BATCH_SIZE
+                    : remaining;
+
+
+            uint32_t got = 0;
+
+
+            esp_err_t ret =
+                adc_continuous_read_parse(
+                    adc_handle_,
+                    adc_samples_.data(),
+                    want,
+                    &got,
+                    50
+                );
+
+
+            if (ret == ESP_ERR_TIMEOUT) {
+
+                timeout_count++;
+
+                if (timeout_count >= 2) {
+
+                    std::fill(
+                        dest + filled,
+                        dest + samples,
+                        0
+                    );
+
+                    return samples;
+                }
+
+                continue;
+            }
+
+
+            if (ret != ESP_OK) {
+
+                ESP_LOGE(
+                    TAG,
+                    "ADC DMA read error: %s",
+                    esp_err_to_name(ret)
+                );
+
+                return 0;
+            }
+
+
+            timeout_count = 0;
+
+
+            for (
+                uint32_t i = 0;
+                i < got && filled < samples;
+                ++i
+            ) {
+
+                const auto& s =
+                    adc_samples_[i];
+
+
+                if (!s.valid) {
+                    continue;
+                }
+
+
+                if (s.unit != mic_adc_unit_ ||
+                    s.channel != mic_adc_channel_) {
+
+                    continue;
+                }
+
+
+                int32_t raw =
+                    static_cast<int32_t>(
+                        s.raw_data
+                    );
+
+
+                // ------------------------------
+                // 自动估计麦克风 DC 中心
+                // ------------------------------
+
+                if (!mic_dc_initialized_) {
+
+                    mic_dc_q16_ =
+                        raw << 16;
+
+                    mic_dc_initialized_ =
+                        true;
+
+                } else {
+
+                    int32_t target =
+                        raw << 16;
+
+                    // 慢速追踪 DC
+                    mic_dc_q16_ +=
+                        (target - mic_dc_q16_) >> 10;
+                }
+
+
+                int32_t dc =
+                    mic_dc_q16_ >> 16;
+
+
+                int32_t centered =
+                    raw - dc;
+
+
+                // 12-bit ADC 映射到 16-bit PCM
+                // 再做 4 倍软件增益
+                int32_t pcm =
+                    centered *
+                    16 *
+                    MIC_GAIN;
+
+
+                if (pcm > 32767) {
+                    pcm = 32767;
+                }
+
+                if (pcm < -32768) {
+                    pcm = -32768;
+                }
+
+
+                dest[filled++] =
+                    static_cast<int16_t>(
+                        pcm
+                    );
+
+
+                int32_t abs_pcm =
+                    pcm >= 0
+                        ? pcm
+                        : -pcm;
+
+
+                if (abs_pcm > peak) {
+                    peak = abs_pcm;
+                }
+            }
+        }
+
+
+        // 大约每半秒打印一次
+        if (++mic_log_counter_ >= 50) {
+
+            ESP_LOGI(
+                TAG,
+                "MIC DMA: peak=%ld dc=%ld samples=%d",
+                static_cast<long>(peak),
+                static_cast<long>(
+                    mic_dc_q16_ >> 16
+                ),
+                samples
+            );
+
+
+            mic_log_counter_ = 0;
+        }
+
+
+        return samples;
+    }
+
+
+    // ========================================================
+    // PCM -> DAC -> 扩展板扬声器
+    // ========================================================
+
+    int Write(
+        const int16_t* data,
+        int samples
+    ) override {
+
+        if (!output_enabled_ ||
+            dac_handle_ == nullptr ||
+            data == nullptr ||
+            samples <= 0) {
+
+            return samples;
+        }
+
+
+        std::lock_guard<std::mutex> lock(
+            driver_mutex_
+        );
+
+
+        if (dac_handle_ == nullptr) {
+            return samples;
+        }
+
+
+        dac_buffer_.resize(
+            static_cast<size_t>(samples)
+        );
+
+
+        int volume =
+            output_volume_;
+
+
+        if (volume < 0) {
+            volume = 0;
+        }
+
+        if (volume > 100) {
+            volume = 100;
+        }
+
+
+        for (int i = 0; i < samples; ++i) {
+
+            int32_t pcm =
+                static_cast<int32_t>(
+                    data[i]
+                );
+
+
+            pcm =
+                pcm *
+                volume /
+                100;
+
+
+            if (pcm > 32767) {
+                pcm = 32767;
+            }
+
+            if (pcm < -32768) {
+                pcm = -32768;
+            }
+
+
+            // signed 16bit PCM
+            // -> unsigned 8bit DAC
+            int32_t value =
+                (pcm + 32768) >> 8;
+
+
+            if (value < 0) {
+                value = 0;
+            }
+
+            if (value > 255) {
+                value = 255;
+            }
+
+
+            dac_buffer_[i] =
+                static_cast<uint8_t>(
+                    value
+                );
+        }
+
+
+        size_t bytes_written = 0;
+
+
+        esp_err_t ret =
+            dac_continuous_write(
+                dac_handle_,
+                dac_buffer_.data(),
+                dac_buffer_.size(),
+                &bytes_written,
+                1000
+            );
+
+
+        if (ret != ESP_OK) {
+
+            ESP_LOGE(
+                TAG,
+                "DAC write error: %s",
+                esp_err_to_name(ret)
+            );
+        }
+
+
+        return samples;
+    }
+
+
+public:
+
+    MpythonV2AudioCodec() {
+
+        duplex_ = false;
+
+        input_reference_ = false;
+
+        input_channels_ = 1;
+        output_channels_ = 1;
+
+        input_sample_rate_ =
+            MIC_SAMPLE_RATE;
+
+        output_sample_rate_ =
+            SPEAKER_SAMPLE_RATE;
+
+
+        dac_buffer_.reserve(2048);
+
+
+        ESP_LOGI(
+            TAG,
+            "mPython V2 half-duplex DMA codec ready"
+        );
+    }
+
+
+    // ========================================================
+    // 麦克风开关
+    // ========================================================
+
+    void EnableInput(bool enable) override {
+
+        if (enable == input_enabled_) {
+            return;
+        }
+
+
+        if (enable) {
+
+            ESP_LOGI(
+                TAG,
+                "MIC requested ON"
+            );
+
+
+            // 如果扬声器还占着 I2S0，
+            // 先把 DAC 完整释放
+            if (output_enabled_) {
+
+                CloseSpeaker();
+
+                AudioCodec::EnableOutput(
+                    false
+                );
+            }
+
+
+            if (!OpenMicrophone()) {
+
+                ESP_LOGE(
+                    TAG,
+                    "Failed to enable microphone"
+                );
+
+                return;
+            }
+
+
+            AudioCodec::EnableInput(
+                true
+            );
+
+        } else {
+
+            ESP_LOGI(
+                TAG,
+                "MIC requested OFF"
+            );
+
+
+            // ADC start / stop 均由音频输入任务完成
+            CloseMicrophone();
+
+
+            AudioCodec::EnableInput(
+                false
+            );
+        }
+    }
+
+
+    // ========================================================
+    // 扬声器开关
+    // ========================================================
+
+    void EnableOutput(bool enable) override {
+
+        if (enable == output_enabled_) {
+            return;
+        }
+
+
+        if (enable) {
+
+            ESP_LOGI(
+                TAG,
+                "Speaker requested ON"
+            );
+
+
+            // ADC Continuous 必须先由 audio_input
+            // 任务自己停止并释放 I2S0。
+            //
+            // audio_service.cc 的修改会立即唤醒输入任务。
+            // 这里最多等待约 500ms。
+            for (
+                int i = 0;
+                i < 100 && input_enabled_;
+                ++i
+            ) {
+
+                vTaskDelay(
+                    pdMS_TO_TICKS(5)
+                );
+            }
+
+
+            if (input_enabled_) {
+
+                ESP_LOGE(
+                    TAG,
+                    "MIC still owns I2S0, speaker start aborted"
+                );
+
+                return;
+            }
+
+
+            if (!OpenSpeaker()) {
+
+                ESP_LOGE(
+                    TAG,
+                    "Failed to enable speaker"
+                );
+
+                return;
+            }
+
+
+            AudioCodec::EnableOutput(
+                true
+            );
+
+        } else {
+
+            ESP_LOGI(
+                TAG,
+                "Speaker requested OFF"
+            );
+
+
+            CloseSpeaker();
+
+
+            AudioCodec::EnableOutput(
+                false
+            );
+        }
     }
 };
 
@@ -679,16 +1031,14 @@ private:
     Display*
         display_ = nullptr;
 
-    Button
-        boot_button_;
 
-    Button
-        button_b_;
+    Button boot_button_;
+    Button button_b_;
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // OLED I2C
-    // --------------------------------------------------------
+    // ========================================================
 
     void InitializeDisplayI2c() {
 
@@ -730,9 +1080,9 @@ private:
     }
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // OLED
-    // --------------------------------------------------------
+    // ========================================================
 
     void InitializeDisplay() {
 
@@ -848,8 +1198,9 @@ private:
 
 
         if (
-            esp_lcd_panel_init(panel_)
-            != ESP_OK
+            esp_lcd_panel_init(
+                panel_
+            ) != ESP_OK
         ) {
 
             ESP_LOGE(
@@ -893,14 +1244,13 @@ private:
     }
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // Buttons
-    // --------------------------------------------------------
+    // ========================================================
 
     void InitializeButtons() {
 
-        // A 键：
-        // 配网 / 切换聊天状态
+        // A 键
         boot_button_.OnClick(
             [this]() {
 
@@ -924,8 +1274,7 @@ private:
         );
 
 
-        // B 键按下：
-        // 开始讲话
+        // B 键按住讲话
         button_b_.OnPressDown(
             [this]() {
 
@@ -941,8 +1290,7 @@ private:
         );
 
 
-        // B 键松开：
-        // 发送并等待小智回答
+        // B 键松开
         button_b_.OnPressUp(
             [this]() {
 
@@ -984,11 +1332,6 @@ public:
         );
     }
 
-
-    // --------------------------------------------------------
-    // 完整 AudioCodec：
-    // MIC + SPEAKER
-    // --------------------------------------------------------
 
     AudioCodec*
     GetAudioCodec() override {
